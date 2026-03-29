@@ -3,7 +3,7 @@ Contributors: gti-inc, taman777
 Tags: security, ip, restriction, login, admin, maintenance, staging
 Requires at least: 5.0
 Tested up to: 6.5
-Stable tag: 1.2.1
+Stable tag: 1.4.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -61,6 +61,22 @@ No. If you restrict the Frontend, you usually restrict Admin/Login too. The "Adm
 3. Access Denied screen (inherits theme design).
 
 == Changelog ==
+
+= 1.4.1 =
+*   **Update:** Improved proxy support (prioritize `HTTP_X_FORWARDED_FOR`).
+*   **Update:** Improved IPv6 normalization and subnet validation.
+*   **Fix:** Resolved an issue where temporary IP restrictions on the latest post would incorrectly apply to the entire front page (archives/home).
+
+= 1.4.0 =
+*   **New:** IPv6 support with auto-detection.
+*   **New:** Robust dual-stack (IPv4/IPv6) validation.
+*   **Update:** Improved debug output (Admins only).
+*   **Update:** "Access Denied" screen now validates against latest IP immediately.
+
+= 1.3.0 =
+*   **New:** Page-specific IP restrictions (Temporary IPs for sharing specific drafts/pages).
+*   **New:** Draft preview support for allowed IPs without login.
+*   **Update:** Visual notification bar for preview mode.
 
 = 1.2.1 =
 *   **UX:** Frontend IP list section now auto-hides when "Allow All" is selected.
