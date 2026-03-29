@@ -4,7 +4,7 @@
  * Plugin Name: IP Login Restrictor
  * Plugin URI: https://github.com/taman777/ip-login-restrictor
  * Description: 指定された IP アドレス・CIDR だけが WordPress にログイン・管理画面にアクセスできます。wp-config.php に定義すれば緊急避難IPも許可されます。
- * Version: 1.3.0
+ * Version: 1.4.1
  * Author: T.Satoh @ GTI Inc.
  * Text Domain: ip-login-restrictor
  * Domain Path: /languages
@@ -16,6 +16,9 @@ if (!defined('ABSPATH')) exit;
 if (file_exists(__DIR__ . '/vendor/autoload.php')) {
     require __DIR__ . '/vendor/autoload.php';
 }
+
+require_once __DIR__ . '/includes/Class_IP_Utils.php';
+
 
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
@@ -54,11 +57,15 @@ class IP_Login_Restrictor
 
         // アクセス制限チェック
         // フロントエンド
-        add_action('template_redirect', [$this, 'check_access']);
+        add_action('template_redirect', [$this, 'check_access']); // Existing hook with default priority 10
         // ログイン画面
-        add_action('login_init',        [$this, 'check_access']);
+        add_action('login_init',        [$this, 'check_access'], 1); // Changed priority to 1
         // 管理画面（admin-ajax等も含む）
-        add_action('admin_init',        [$this, 'check_access']);
+        add_action('admin_init',        [$this, 'check_access'], 1); // Changed priority to 1
+        // フロントエンドの通常アクセスもチェックするために template_redirect にもフックする (追加)
+        add_action('template_redirect', [$this, 'check_access'], 1); // Added hook with priority 1
+
+        add_action('wp_footer', [$this, 'debug_access_reason']); // Debug logic
 
         // プレビュー通知バー（画面下部）
         add_action('wp_footer',         [$this, 'show_preview_notice']);
@@ -111,7 +118,7 @@ class IP_Login_Restrictor
     }
 
     /** 翻訳対応のデフォルト本文（HTML）を返す */
-    private function get_default_body_html_translated()
+    private static function get_default_body_html_translated()
     {
         // トークンはこのまま保持（後で置換）
         $tpl = __(
@@ -175,7 +182,7 @@ class IP_Login_Restrictor
     /** アクセスチェック本体（常にプレーンHTMLで安全に返す） */
     public function check_access()
     {
-        if (!$this->is_enabled()) return;
+        // if (!$this->is_enabled()) return; // 削除: 個別ページ制限のみ有効な場合に対応するため
         if (defined('REMOVE_WP_LOGIN_IP_ADDRESS') && REMOVE_WP_LOGIN_IP_ADDRESS === true) return;
 
         // Ajax/post は除外
@@ -183,12 +190,23 @@ class IP_Login_Restrictor
 
         // 対象エリア判定
         $is_admin_area = is_admin() || $this->is_login_page();
+        $frontend_enabled = $this->is_frontend_enabled();
+        $plugin_enabled = $this->is_enabled();
 
         // ページ個別の臨時IP設定を確認（フロントエンドの場合）
         $page_temp_ips_active = false;
         $post_id = 0;
         if (!$is_admin_area) {
             $post_id = get_queried_object_id();
+            if (!$post_id) {
+                 global $post;
+                 // is_singular() の場合のみ $post->ID をフォールバックとして使用する
+                 // これがないと、トップページ（最新の投稿）で最初の記事の制限がページ全体に誤爆する
+                 if ($post && isset($post->ID) && is_singular()) {
+                     $post_id = $post->ID;
+                 }
+            }
+            
             if ($post_id) {
                 $enabled_meta = get_post_meta($post_id, self::META_TEMPORARY_IPS . '_enabled', true);
                 if ($enabled_meta === '1') {
@@ -202,18 +220,30 @@ class IP_Login_Restrictor
                             $page_temp_ips_active = true;
                         }
                     } else {
-                        // 期限なし（本来は設定すべきだが、互換性のため許可）
+                        // 期限なし
                         $page_temp_ips_active = true;
                     }
                 }
             }
         }
 
-        // 管理画面系ではなく、かつフロントエンド制限が無効、かつページ個別制限も無効なら何もしない
-        if (!$is_admin_area && !$this->is_frontend_enabled() && !$page_temp_ips_active) {
+        // 1. プラグイン全体が無効 かつ 個別ページ制限もない → 何もしない
+        if (!$plugin_enabled && !$page_temp_ips_active) {
             return;
         }
 
+        // 2. プラグイン全体が無効だが、個別ページ制限がある場合
+        //    → 管理画面エリアなら何もしない（個別ページ制限はフロントエンドのみ）
+        if (!$plugin_enabled && $is_admin_area) {
+            return;
+        }
+        
+        // 3. フロントエンドで、全体無効ではなく、フロント制限無効、かつ個別制限もない → 何もしない
+        if (!$is_admin_area && $plugin_enabled && !$frontend_enabled && !$page_temp_ips_active) {
+            return;
+        }
+
+        // ここからIPチェック処理
         $admin_ips = get_option(self::OPTION_IPS, []);
         if (defined('WP_LOGIN_IP_ADDRESS')) {
              // 緊急避難IP対応（カンマ区切り/配列対応）
@@ -232,9 +262,27 @@ class IP_Login_Restrictor
             // 管理画面エリア: 管理用IPリストのみ
             $allowed_ips = $admin_ips;
         } else {
-            // フロントエンド: 管理用 + フロント用
-            $frontend_ips = get_option(self::OPTION_FRONTEND_IPS, []);
-            $allowed_ips  = array_merge($admin_ips, $frontend_ips);
+            // フロントエンド
+            
+            // 管理者としてログイン済みの場合は、IPに関わらず許可する
+            if (current_user_can('manage_options')) {
+                return;
+            }
+            
+            // $allowed_ips = $admin_ips; // 修正前: 無条件に管理者許可
+            $allowed_ips = [];
+
+            // プラグイン全体が「有効」な場合のみ、管理者リスト（Global）を許可対象に含める
+            // 「無効」の場合は、管理者リストであっても許可しない（個別ページ設定のみを評価する）
+            if ($plugin_enabled) {
+                $allowed_ips = $admin_ips;
+            }
+
+            // フロントエンド制限が有効な場合のみ、フロントエンド共通リストを追加
+            if ($plugin_enabled && $frontend_enabled) {
+                $frontend_ips = get_option(self::OPTION_FRONTEND_IPS, []);
+                $allowed_ips  = array_merge($allowed_ips, $frontend_ips);
+            }
 
             // ページ固有の臨時IPを追加（有効な場合）
             if ($page_temp_ips_active && $post_id) {
@@ -247,8 +295,29 @@ class IP_Login_Restrictor
             }
         }
 
-        $remote_ip = $this->get_client_ip();
-        if (!$this->ip_in_allowed_list($remote_ip, $allowed_ips)) {
+
+
+        $client_ips = IP_Login_Restrictor_Utils::get_client_ips();
+
+        // 許可されているかチェック
+        if (IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $allowed_ips)) {
+             return;
+        }
+
+        // 許可されていない場合、かつまだJSチェックおよびPOST送信が行われていない場合
+        // （ループ防止は Utils 側でも行っているが、ここでもチェック）
+        if ( ($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($_POST['iplr_denied_client_ip'])) && empty($_POST['iplr_denied_checked']) ) {
+             IP_Login_Restrictor_Utils::render_js_collector_page();
+        }
+
+        // ここまで来たら完全に拒否（JSチェック後もNGだった、あるいはJSチェック済み）
+        // 表示用のIPは、可能な限りメインのものを取得（IPv4優先などはお好みだが、allの先頭などを表示）
+        // ユーザーが管理者へ連絡する際、複数の候補（IPv4/IPv6）を伝えられるように全て表示する
+        $remote_ip = implode(', ', $client_ips['all'] ?? []);
+
+        // if (!$this->ip_in_allowed_list($remote_ip, $allowed_ips)) { // 既にチェック済み
+        {
+
             // 403 + HTML
             status_header(403);
             nocache_headers();
@@ -257,7 +326,7 @@ class IP_Login_Restrictor
             // 本文（未設定や空なら翻訳済みデフォルトで補填）
             $body_html = get_option(self::OPTION_MSG_BODY, '');
             if ($body_html === '') {
-                $body_html = $this->get_default_body_html_translated();
+                $body_html = self::get_default_body_html_translated();
             }
             $body_html = wp_kses_post($body_html);
 
@@ -374,10 +443,12 @@ class IP_Login_Restrictor
      */
     private function is_ip_allowed_for_post($post_id)
     {
-        // プラグイン自体が無効なら、この機能で特別に表示させることはしない（標準のWP動作に任せる）
-        if (!$this->is_enabled()) return false;
+        // プラグイン自体が無効でも、ページ個別設定があれば判定を行う
+        // check_access() と同様のロジックで対応
+        // if (!$this->is_enabled()) return false;
 
-        $remote_ip = $this->get_client_ip();
+        $client_ips = IP_Login_Restrictor_Utils::get_client_ips();
+
         
         // 管理用IPリスト（緊急避難IP含む）
         $admin_ips = get_option(self::OPTION_IPS, []);
@@ -391,14 +462,15 @@ class IP_Login_Restrictor
              }
         }
 
-        if ($this->ip_in_allowed_list($remote_ip, $admin_ips)) {
+        if (IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $admin_ips)) {
             return true;
         }
 
         // フロントエンドIPリスト
-        if ($this->is_frontend_enabled()) {
+        // プラグイン全体が有効かつフロントエンド制限も有効な場合のみチェック
+        if ($this->is_enabled() && $this->is_frontend_enabled()) {
             $frontend_ips = get_option(self::OPTION_FRONTEND_IPS, []);
-            if ($this->ip_in_allowed_list($remote_ip, $frontend_ips)) {
+            if (IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $frontend_ips)) {
                 return true;
             }
         }
@@ -419,9 +491,15 @@ class IP_Login_Restrictor
             if ($temporary_ips) {
                 $temp_ips_array = preg_split("/\r\n|\r|\n/", $temporary_ips);
                 $temp_ips_array = array_filter(array_map('trim', $temp_ips_array));
-                if ($this->ip_in_allowed_list($remote_ip, $temp_ips_array)) {
+                if (IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $temp_ips_array)) {
                     return true;
                 }
+            }
+
+            // ここで許可されていない場合、かつJSチェックがまだならJS Collectorを表示して終了させる
+            // （check_access と同様のロジック）
+            if ( ($_SERVER['REQUEST_METHOD'] !== 'POST' || empty($_POST['iplr_denied_client_ip'])) && empty($_POST['iplr_denied_checked']) ) {
+                IP_Login_Restrictor_Utils::render_js_collector_page();
             }
         }
 
@@ -514,12 +592,12 @@ class IP_Login_Restrictor
 
         // 「デフォルトに戻す」ボタン
         if (isset($_POST['iplr_restore_default_body']) && $_POST['iplr_restore_default_body'] === '1') {
-            update_option(self::OPTION_MSG_BODY, $this->get_default_body_html_translated());
+            update_option(self::OPTION_MSG_BODY, self::get_default_body_html_translated());
         }
 
         // 空なら翻訳済みデフォルトで補填
         if (get_option(self::OPTION_MSG_BODY, '') === '') {
-            update_option(self::OPTION_MSG_BODY, $this->get_default_body_html_translated());
+            update_option(self::OPTION_MSG_BODY, self::get_default_body_html_translated());
         }
         // 保存後に安全にリダイレクト（管理バーも最新状態で描画）
         wp_safe_redirect(
@@ -541,16 +619,34 @@ class IP_Login_Restrictor
         $stored_key = get_option(self::OPTION_RESCUE_KEY, '');
 
         if ($stored_key !== '' && $input_key === $stored_key) {
-            $ip = $this->get_client_ip();
+            $client_ips = IP_Login_Restrictor_Utils::get_client_ips();
             $ips = get_option(self::OPTION_IPS, []);
             
-            // 既にリストにあるかチェック（IP or CIDR）
-            if (!$this->ip_in_allowed_list($ip, $ips)) {
-                $ips[] = $ip;
+            $added_ips = [];
+            foreach ($client_ips['all'] as $ip) {
+                if (!IP_Login_Restrictor_Utils::ip_matches($ip, $ips)) { // 配列ではなく単体v.s.リスト一括チェックはUtilsにはないが、ループで回す
+                    // ※ ip_matches は (string, string) なので、既存リスト全体に対してチェックする必要がある
+                    // ここではシンプルに「既存リストに含まれているか」を確認
+                    $already_in = false;
+                    foreach ($ips as $allowed_cidr) {
+                        if (IP_Login_Restrictor_Utils::ip_matches($ip, $allowed_cidr)) {
+                            $already_in = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!$already_in) {
+                        $ips[] = $ip;
+                        $added_ips[] = $ip;
+                    }
+                }
+            }
+
+            if (!empty($added_ips)) {
                 update_option(self::OPTION_IPS, $ips);
-                $msg = sprintf(__('Success! IP %s has been added to the whitelist.', 'ip-login-restrictor'), $ip);
+                $msg = sprintf(__('Success! IPs [%s] have been added to the whitelist.', 'ip-login-restrictor'), implode(', ', $added_ips));
             } else {
-                $msg = sprintf(__('IP %s is already in the whitelist.', 'ip-login-restrictor'), $ip);
+                $msg = __('Your IP is already in the whitelist.', 'ip-login-restrictor');
             }
 
             // 完了メッセージを表示してログインへ
@@ -583,7 +679,13 @@ class IP_Login_Restrictor
         $frontend_ips     = implode("\n", get_option(self::OPTION_FRONTEND_IPS, []));
         $msg_body   = (string) get_option(self::OPTION_MSG_BODY, '');
         $preview_msg = (string) get_option(self::OPTION_PREVIEW_MSG, __('You are viewing this preview because your IP is whitelisted.', 'ip-login-restrictor'));
-        $current_ip = esc_html($this->get_client_ip());
+        
+        $c_ips = IP_Login_Restrictor_Utils::get_client_ips();
+        $current_ip_v4 = implode(', ', $c_ips['ipv4']);
+        $current_ip_v6 = implode(', ', $c_ips['ipv6']);
+        // ボタンアクション用にメインのIPを決める（とりあえず先頭）
+        $current_ip_primary = $c_ips['all'][0] ?? '';
+        $primary_v6 = $c_ips['ipv6'][0] ?? '';
 
         // ページ単位の制限が有効なページを取得
         $temp_pages_query = new WP_Query([
@@ -727,16 +829,29 @@ class IP_Login_Restrictor
                 <p class="description"><?php _e('These IPs can access EVERYTHING (Admin, Login, and Frontend).', 'ip-login-restrictor'); ?></p>
                 <textarea name="ip_login_restrictor_ips" rows="8" cols="60"><?php echo esc_textarea($admin_ips); ?></textarea>
                 <p>
-                    <button type="button" class="button" onclick="addCurrentIP('ip_login_restrictor_ips')"><?php _e('Add current IP to Admin List', 'ip-login-restrictor'); ?></button>
-                    <span style="margin-left:10px;"><?php _e('Your IP:', 'ip-login-restrictor'); ?> <?php echo $current_ip; ?></span>
+                    <button type="button" class="button" onclick="addCurrentIP('ip_login_restrictor_ips', '<?php echo esc_js($current_ip_primary); ?>')"><?php _e('Add current IP to Admin List', 'ip-login-restrictor'); ?></button>
+                    <?php if ($primary_v6 && $primary_v6 !== $current_ip_primary): ?>
+                        <button type="button" class="button" style="margin-left:5px;" onclick="addCurrentIP('ip_login_restrictor_ips', '<?php echo esc_js($primary_v6); ?>')"><?php _e('Add IPv6 to Admin List', 'ip-login-restrictor'); ?></button>
+                    <?php endif; ?>
+                    <span style="margin-left:10px;">
+                        <?php _e('Your IP:', 'ip-login-restrictor'); ?> 
+                        <strong><?php echo $current_ip_v4 ?: ($current_ip_v6 ?: 'Unknown'); ?></strong>
+                        <?php if ($current_ip_v6 && $current_ip_v4): ?>
+                             (IPv6: <?php echo $current_ip_v6; ?>)
+                        <?php endif; ?>
+                    </span>
                 </p>
+                
+                <!-- External IPv6 detection result will appear here -->
+                <div id="iplr-detected-ipv6-box" style="display:none; margin-top:5px; margin-left:10px; padding:5px; background:#f0f0f1; border-left:4px solid #72aee6;">
+                </div>
 
                 <div id="iplr-frontend-ips-section" style="<?php echo $frontend_enabled ? '' : 'display:none;'; ?>">
                     <h3><?php _e('Frontend Only Allowed IPs', 'ip-login-restrictor'); ?></h3>
                     <p class="description"><?php _e('These IPs can ONLY access the Frontend (Normal pages). Ignored if Frontend Restriction is disabled.', 'ip-login-restrictor'); ?></p>
                     <textarea name="ip_login_restrictor_frontend_ips" rows="8" cols="60"><?php echo esc_textarea($frontend_ips); ?></textarea>
                     <p>
-                        <button type="button" class="button" onclick="addCurrentIP('ip_login_restrictor_frontend_ips')"><?php _e('Add current IP to Frontend List', 'ip-login-restrictor'); ?></button>
+                        <button type="button" class="button" onclick="addCurrentIP('ip_login_restrictor_frontend_ips', '<?php echo esc_js($current_ip_primary); ?>')"><?php _e('Add current IP to Frontend List', 'ip-login-restrictor'); ?></button>
                     </p><br>
                 </div>
 
@@ -765,10 +880,9 @@ class IP_Login_Restrictor
                 </p>
             </form>
 
-            <p><strong><?php _e('Emergency IP:', 'ip-login-restrictor'); ?></strong>
-                <?php _e('You can add', 'ip-login-restrictor'); ?>
-                <code>define('WP_LOGIN_IP_ADDRESS', 'xxx.xxx.xxx.xxx');</code>
-                <?php _e('to wp-config.php to allow access.', 'ip-login-restrictor'); ?>
+            <p><strong><?php _e('Emergency IP (IPv4/IPv6):', 'ip-login-restrictor'); ?></strong>
+                <?php _e('To manually whitelist an IPv4 or IPv6 address, add this to wp-config.php:', 'ip-login-restrictor'); ?>
+                <code>define('WP_LOGIN_IP_ADDRESS', '192.0.2.1, 2001:db8::1');</code>
             </p>
             <p><strong><?php _e('Disable restriction:', 'ip-login-restrictor'); ?></strong>
                 <?php _e('Add', 'ip-login-restrictor'); ?>
@@ -847,8 +961,8 @@ class IP_Login_Restrictor
             </div>
         </div>
         <script>
-            function addCurrentIP(targetName) {
-                const ip = "<?php echo esc_js($this->get_client_ip()); ?>";
+            function addCurrentIP(targetName, ipValue) {
+                const ip = ipValue || "<?php echo esc_js($this->get_client_ip()); ?>";
                 const textarea = document.querySelector('textarea[name="' + targetName + '"]');
                 const lines = textarea.value.split(/\r?\n/).map(l => l.trim());
                 if (!lines.includes(ip)) {
@@ -870,6 +984,49 @@ class IP_Login_Restrictor
                     }
                 });
             });
+
+            // Auto-detect IPv6 via JS (for cases where server connection is IPv4)
+            (async function() {
+                const detectBox = document.getElementById('iplr-detected-ipv6-box');
+                if (!detectBox) return;
+
+                const clientApis = [
+                    // IPv6優先のAPIを先に配置
+                    "https://api64.ipify.org?format=json", // v4/v6 dual stack
+                    "https://ifconfig.co/json",
+                    "https://ipinfo.io/json"
+                ];
+
+                let foundIp = "";
+                for (const url of clientApis) {
+                    try {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 4000);
+                        const res = await fetch(url, { signal: controller.signal });
+                        clearTimeout(timeoutId);
+                        const json = await res.json();
+                        if (json.ip && json.ip.indexOf(':') !== -1) { // IPv6 check
+                            foundIp = json.ip;
+                            break;
+                        }
+                    } catch (e) {
+                        // ignore
+                    }
+                }
+
+                if (foundIp) {
+                    // サーバー側で既に同じIPv6が取れている場合は表示しない
+                    const currentV4 = "<?php echo esc_js($current_ip_v4); ?>";
+                    const currentV6 = "<?php echo esc_js($current_ip_v6); ?>";
+                    
+                    if (foundIp !== currentV4 && foundIp !== currentV6) {
+                        detectBox.style.display = 'block';
+                        detectBox.innerHTML = 
+                            '<strong>IPv6: ' + foundIp + '</strong> ' + 
+                            '<button type="button" class="button button-small" style="margin-left:5px;" onclick="addCurrentIP(\'ip_login_restrictor_ips\', \'' + foundIp + '\')"><?php echo esc_js(__('Add', 'ip-login-restrictor')); ?></button>';
+                    }
+                }
+            })();
         </script>
     <?php
     }
@@ -903,10 +1060,12 @@ class IP_Login_Restrictor
             $temporary_ips_enabled = '0';
         }
 
-        // デフォルトの期限（新規作成時のみ 24時間後）
+        // デフォルトの期限（新規作成時のみ）→「空」の場合は無期限とするので、自動設定はしない
+        /*
         if ($expire_at === '' && empty($temporary_ips)) {
             $expire_at = date('Y-m-d\TH:i', current_time('timestamp') + 24 * 3600);
         }
+        */
 
         $is_expired = false;
         if ($expire_at) {
@@ -936,7 +1095,7 @@ class IP_Login_Restrictor
         <p style="margin-top:12px; font-weight:bold;"><?php _e('Expiration Date/Time:', 'ip-login-restrictor'); ?></p>
         <input type="datetime-local" name="iplr_temporary_ips_expire" value="<?php echo esc_attr($expire_at); ?>" style="width:100%;">
         <p class="description">
-            <?php _e('The page IP restriction will be automatically disabled after this time.', 'ip-login-restrictor'); ?>
+            <?php _e('Leave empty for no expiration. The page IP restriction will be automatically disabled after this time.', 'ip-login-restrictor'); ?>
             <?php if ($is_expired): ?>
                 <br><span style="color:#d63638;font-weight:bold;"><?php _e('Status: Expired', 'ip-login-restrictor'); ?></span>
             <?php endif; ?>
@@ -947,25 +1106,103 @@ class IP_Login_Restrictor
         <p class="description"><?php _e('This message will replace the {page_message} token in the access denied body.', 'ip-login-restrictor'); ?></p>
 
         <p style="margin-top:8px;">
-            <button type="button" class="button button-small" onclick="iplrAddCurrentIP()">
-                <?php _e('Add current IP', 'ip-login-restrictor'); ?>
+            <button type="button" class="button button-small" onclick="iplrAddCurrentIP('<?php echo esc_js($current_ip); ?>')">
+                <?php _e('Add Current IP', 'ip-login-restrictor'); ?>
             </button>
             <span style="margin-left:8px;font-size:11px;color:#666;">
                 <?php _e('Your IP:', 'ip-login-restrictor'); ?> <?php echo $current_ip; ?>
             </span>
         </p>
+        
+        <!-- IPv6 Button Row (Hidden by default) -->
+        <p style="margin-top:4px; display:none;" id="iplr-ipv6-row">
+            <button type="button" class="button button-small" id="iplr-add-ipv6-btn">
+                <?php _e('Add Current IPv6', 'ip-login-restrictor'); ?>
+            </button>
+            <span style="margin-left:8px;font-size:11px;color:#666; font-weight:bold;" id="iplr-ipv6-text">
+                <!-- IPv6 address -->
+            </span>
+        </p>
+        
         <script>
-            function iplrAddCurrentIP() {
-                const ip = "<?php echo esc_js($this->get_client_ip()); ?>";
+            function iplrAddCurrentIP(val) {
+                // val が空なら変数から...というロジックだが、ボタンからは常に渡すようにする
+                const ip = val;
+                if (!ip) return;
+
                 const textarea = document.querySelector('textarea[name="iplr_temporary_ips"]');
-                const lines = textarea.value.split(/\r?\n/).map(l => l.trim());
-                if (!lines.includes(ip)) {
-                    lines.push(ip);
-                    textarea.value = lines.filter(Boolean).join("\n");
+                // 既存の内容を取得（空行除去）
+                let currentVal = textarea.value.replace(/\r/g, '').split('\n').map(l => l.trim()).filter(l => l !== '');
+                
+                if (!currentVal.includes(ip)) {
+                    currentVal.push(ip);
+                    textarea.value = currentVal.join("\n") + "\n"; // 末尾改行
+                    // alert("<?php echo esc_js(__('Added IP:', 'ip-login-restrictor')); ?> " + ip);
                 } else {
                     alert("<?php echo esc_js(__('This IP address is already added.', 'ip-login-restrictor')); ?>");
                 }
             }
+ 
+            // Auto-detect IPv6
+            window.iplrDetectIPv6 = async function() {
+                const row = document.getElementById('iplr-ipv6-row');
+                const text = document.getElementById('iplr-ipv6-text');
+                const btn = document.getElementById('iplr-add-ipv6-btn');
+                
+                if (!row) return;
+                
+                // Show checking state if visible
+                if (row.style.display !== 'none') {
+                    // Start checking
+                    text.innerHTML = '<span class="dashicons dashicons-update spin" style="font-size:14px;vertical-align:middle;"></span> <?php echo esc_js(__('Checking...', 'ip-login-restrictor')); ?>';
+                }
+
+                const clientApis = [
+                    "https://api64.ipify.org?format=json&t=" + Date.now(),
+                    "https://ifconfig.co/json?t=" + Date.now()
+                ];
+
+                let foundIp = "";
+                for (const url of clientApis) {
+                    try {
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 4000); // 4 sec timeout
+                        const res = await fetch(url, { signal: controller.signal });
+                        clearTimeout(timeoutId);
+                        const json = await res.json();
+                        if (json.ip && json.ip.indexOf(':') !== -1) { 
+                            foundIp = json.ip;
+                            break;
+                        }
+                    } catch (e) {}
+                }
+                
+                const currentIp = "<?php echo esc_js($current_ip); ?>";
+                
+                if (foundIp && foundIp !== currentIp) {
+                    row.style.display = 'block';
+                    text.innerHTML = '<?php echo esc_js(__('IPv6 detected:', 'ip-login-restrictor')); ?> ' + foundIp + 
+                        ' <a href="#" onclick="iplrDetectIPv6(); return false;" class="dashicons dashicons-update" style="text-decoration:none; margin-left:5px; vertical-align:middle; cursor:pointer;" title="<?php echo esc_js(__('Refresh', 'ip-login-restrictor')); ?>"></a>';
+                    
+                    btn.onclick = function() {
+                        iplrAddCurrentIP(foundIp);
+                    };
+                } else {
+                    // Not found or same as IPv4 (which means no separate IPv6 or only IPv4)
+                    if (row.style.display !== 'none') {
+                         if (!foundIp) {
+                             text.innerHTML = '<?php echo esc_js(__('IPv6 detection failed.', 'ip-login-restrictor')); ?> <a href="#" onclick="iplrDetectIPv6(); return false;" class="dashicons dashicons-update" style="text-decoration:none; margin-left:5px; vertical-align:middle;"></a>';
+                         } else {
+                             // Same as v4, hide row? Or verify?
+                             // Usually if same, we hide.
+                             row.style.display = 'none';
+                         }
+                    }
+                }
+            };
+            
+            // Run on load
+            iplrDetectIPv6();
         </script>
         <?php
     }
@@ -1094,6 +1331,46 @@ class IP_Login_Restrictor
                 'title'  => esc_html(sprintf(__('Your IP: %s', 'ip-login-restrictor'), $this->get_client_ip())),
                 'href'   => false,
             ]);
+            
+            // IPv6用のプレースホルダーメニュー
+            $wp_admin_bar->add_node([
+                'id'     => 'ip-login-restrictor-ipv6-detect',
+                'parent' => 'ip-login-restrictor-status',
+                'title'  => '<span id="iplr-adminbar-ipv6" style="font-size:11px; color:#aaa;">Check IPv6...</span>',
+                'href'   => false,
+                'meta'   => ['html' => '<script>
+                    (async function(){
+                        const el = document.getElementById("iplr-adminbar-ipv6");
+                        if(!el) return;
+                        const clientApis = ["https://api64.ipify.org?format=json", "https://ifconfig.co/json"];
+                        let foundIp = "";
+                        for (const url of clientApis) {
+                            try {
+                                const controller = new AbortController();
+                                const timeoutId = setTimeout(() => controller.abort(), 4000);
+                                const res = await fetch(url, { signal: controller.signal });
+                                clearTimeout(timeoutId);
+                                const json = await res.json();
+                                if (json.ip && json.ip.indexOf(":") !== -1) { foundIp = json.ip; break; }
+                            } catch(e){}
+                        }
+                        if(foundIp) {
+                            const current = "' . esc_js($this->get_client_ip()) . '";
+                            if(foundIp !== current) {
+                                el.innerHTML = "IPv6: " + foundIp;
+                                el.style.color = "#fff";
+                                // 親要素のスタイル調整（任意）
+                                const parent = el.closest(".ab-item");
+                                if(parent) parent.style.height = "auto";
+                            } else {
+                                el.parentElement.parentElement.style.display = "none";
+                            }
+                        } else {
+                            el.innerHTML = "IPv6: None";
+                        }
+                    })();
+                </script>'],
+            ]);
         }
     }
 
@@ -1109,16 +1386,18 @@ class IP_Login_Restrictor
                 /* 緑 */
                 color: #fff !important;
             }
-
             #wpadminbar .iplr-on>.ab-item:hover {
                 background-color: #218838 !important;
                 /* 濃い緑 */
             }
-
             #wpadminbar .iplr-off>.ab-item {
                 background-color: #6c757d !important;
                 /* グレー */
                 color: #fff !important;
+            }
+            /* サブメニューのスタイル調整 */
+            #wp-admin-bar-ip-login-restrictor-status-default li {
+                height: auto !important;
             }
         </style>
 <?php
@@ -1278,6 +1557,107 @@ class IP_Login_Restrictor
             echo ' <a href="' . admin_url('admin.php?page=ip-login-restrictor') . '" style="color: #fff; text-decoration: underline; margin-left: 15px; font-weight: normal; font-size: 13px;">' . esc_html__('View Details', 'ip-login-restrictor') . '</a>';
             echo '</p></div>';
         }
+    }
+    /**
+     * デバッグ用：管理者にはフッターに判定理由を表示
+     */
+    public function debug_access_reason()
+    {
+        if (!current_user_can('manage_options')) return;
+
+        // Restriction Active Check
+        $plugin_enabled = $this->is_enabled();
+        $is_frontend_enabled = $this->is_frontend_enabled();
+        $page_restriction_active = false;
+        
+        $pid = 0;
+        if (is_singular()) {
+             $pid = get_the_ID();
+             if (!$pid) {
+                 global $post;
+                 if ($post && isset($post->ID)) $pid = $post->ID;
+             }
+             if ($pid) {
+                 $temp_enabled = get_post_meta($pid, self::META_TEMPORARY_IPS . '_enabled', true);
+                 if ($temp_enabled === '1') {
+                     $page_restriction_active = true;
+                 }
+             }
+        }
+        
+        $frontend_restriction_active = ($plugin_enabled && $is_frontend_enabled);
+        
+        if (!$frontend_restriction_active && !$page_restriction_active) {
+            return; 
+        }
+
+        $client_ips = IP_Login_Restrictor_Utils::get_client_ips();
+        
+        $v4 = implode(', ', $client_ips['ipv4']);
+        $v6 = implode(', ', $client_ips['ipv6']);
+        $ip_display = $v4 ?: 'Unknown';
+        if ($v6) {
+            $ip_display .= ' <span style="color:#aaf;">[IPv6: ' . $v6 . ']</span>';
+        }
+
+        // Admin match?
+        $admin_ips = get_option(self::OPTION_IPS, []);
+        if (defined('WP_LOGIN_IP_ADDRESS')) {
+             $emergency = WP_LOGIN_IP_ADDRESS;
+             if (is_string($emergency)) $emergency = preg_split('/[\s,]+/', $emergency, -1, PREG_SPLIT_NO_EMPTY);
+             if (is_array($emergency)) $admin_ips = array_merge($admin_ips, $emergency);
+        }
+        
+        // Debug: Show allowed IPs for page
+        $page_status = '';
+        if ($page_restriction_active && $pid) {
+             $temp_ips = get_post_meta($pid, self::META_TEMPORARY_IPS, true);
+             $page_status = ' <br><strong>Page Allowed IPs:</strong> ' . esc_html(str_replace(["\r", "\n"], ' ', trim($temp_ips)));
+        }
+        
+        $is_admin_allowed = IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $admin_ips);
+        
+        if ($is_admin_allowed) {
+            $reason = "Allowed by <strong>Admin/Global List</strong>";
+            if (!$this->is_enabled()) {
+                $reason .= " <small>(Safety Override - Plugin Disabled)</small>";
+            }
+            echo '<div style="background:#000;color:#0f0;padding:10px;position:fixed;bottom:0;left:0;z-index:999999;font-size:12px;opacity:0.9;line-height:1.5;">IPLR Debug: ' . $reason . ' (' . $ip_display . ')' . $page_status . '</div>';
+            return;
+        }
+
+        // Frontend match?
+        $frontend_ips = get_option(self::OPTION_FRONTEND_IPS, []);
+        $plugin_enabled = $this->is_enabled();
+        $is_frontend_enabled = $this->is_frontend_enabled();
+        
+        if ($plugin_enabled && $is_frontend_enabled && IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $frontend_ips)) {
+            echo '<div style="background:#000;color:#0f0;padding:10px;position:fixed;bottom:0;left:0;z-index:999999;font-size:12px;opacity:0.9;line-height:1.5;">IPLR Debug: Allowed by <strong>Frontend List</strong> (' . $ip_display . ')' . $page_status . '</div>';
+            return;
+        }
+
+        // Page match?
+        if (is_singular()) {
+            $pid = get_the_ID();
+             if (!$pid) {
+                 global $post;
+                 if ($post && isset($post->ID)) $pid = $post->ID;
+             }
+            
+            $temp_enabled = get_post_meta($pid, self::META_TEMPORARY_IPS . '_enabled', true);
+            if ($temp_enabled === '1') {
+                $temp_ips = get_post_meta($pid, self::META_TEMPORARY_IPS, true);
+                $temp_ips_array = preg_split("/\r\n|\r|\n/", $temp_ips);
+                if (IP_Login_Restrictor_Utils::client_is_allowed($client_ips, $temp_ips_array)) {
+                     echo '<div style="background:#000;color:#0f0;padding:10px;position:fixed;bottom:0;left:0;z-index:999999;font-size:12px;opacity:0.9;line-height:1.5;">IPLR Debug: Allowed by <strong>Page Specific List</strong> (' . $ip_display . ')' . $page_status . '</div>';
+                     return;
+                }
+                echo '<div style="background:#000;color:#f00;padding:10px;position:fixed;bottom:0;left:0;z-index:999999;font-size:12px;opacity:0.9;line-height:1.5;">IPLR Debug: <strong>Should be DENIED</strong> by Page List (' . $ip_display . ')' . $page_status . '</div>';
+                return;
+            }
+        }
+        
+        echo '<div style="background:#000;color:#fff;padding:10px;position:fixed;bottom:0;left:0;z-index:999999;font-size:12px;opacity:0.9;line-height:1.5;">IPLR Debug: No specific restriction matched (' . $ip_display . ')' . $page_status . '</div>';
     }
 }
 

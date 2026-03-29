@@ -106,20 +106,17 @@ msgstr "デフォルトのメッセージに戻す"
 msgid "Save Changes"
 msgstr "変更を保存"
 
-msgid "Emergency IP:"
-msgstr "緊急時のIP追加:"
+msgid "Emergency IP (IPv4/IPv6):"
+msgstr "緊急時のIP追加 (IPv4/IPv6):"
 
-msgid "You can add"
-msgstr "wp-config.php に以下を追記することで、IPを許可できます。"
+msgid "To manually whitelist an IPv4 or IPv6 address, add this to wp-config.php:"
+msgstr "IPv4またはIPv6アドレスを手動で許可リストに追加するには、wp-config.php に以下を追記します:"
 
 msgid "to wp-config.php to allow access."
 msgstr ""
 
 msgid "Disable restriction:"
 msgstr "制限の強制解除:"
-
-msgid "Add"
-msgstr "wp-config.php に以下を追記することで、すべての制限を無効化できます。"
 
 msgid "to disable all IP restrictions."
 msgstr ""
@@ -241,3 +238,21 @@ msgstr "ページ単位のIP制御あり"
 
 msgid "View Details"
 msgstr "詳細を確認"
+
+msgid "Checking..."
+msgstr "確認中..."
+
+msgid "Refresh"
+msgstr "再取得"
+
+msgid "IPv6 detection failed."
+msgstr "IPv6の検出に失敗しました。"
+
+msgid "Add IPv6 to Admin List"
+msgstr "IPv6を管理用リストに追加"
+
+msgid "Add"
+msgstr "追加"
+
+msgid "IPv6 detected:"
+msgstr "IPv6を検出しました:"
